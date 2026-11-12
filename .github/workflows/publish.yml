@@ -1,0 +1,82 @@
+name: Publier les pseudos Patreon
+
+on:
+  repository_dispatch:
+    types: [patreon-feed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Télécharger et valider le fichier
+        env:
+          RENDER_FEED_URL: ${{ vars.RENDER_FEED_URL }}
+          PAGES_FEED_KEY: ${{ secrets.PAGES_FEED_KEY }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          url = os.environ['RENDER_FEED_URL']
+          key = os.environ['PAGES_FEED_KEY']
+          if not re.fullmatch(r'https://[a-z0-9-]+\.onrender\.com/pages/supporters\.json', url) or len(key) < 32:
+              raise SystemExit('Missing or invalid feed configuration')
+          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + key})
+          opener = urllib.request.build_opener(NoRedirect)
+          for attempt in range(4):
+              try:
+                  with opener.open(request, timeout=10) as response:
+                      raw = response.read(150_001)
+                  break
+              except urllib.error.HTTPError as exc:
+                  if exc.code not in (502, 503, 504) or attempt == 3:
+                      raise SystemExit(f'Feed download returned HTTP {exc.code}') from None
+              except OSError:
+                  if attempt == 3:
+                      raise SystemExit('Feed download unavailable') from None
+              time.sleep(10)
+          try:
+              data = json.loads(raw) if len(raw) <= 150_000 else None
+              if not isinstance(data, dict) or set(data) != {'version', 'names'} or type(data['version']) is not int or data['version'] != 1:
+                  raise ValueError()
+              names = data['names']
+              if not isinstance(names, list) or len(names) > 1_000 or any(
+                  not isinstance(name, str) or not name or name.strip() != name or
+                  len(name.encode('utf-16-le')) > 96 or any(c in name for c in '\r\n\t') for name in names
+              ):
+                  raise ValueError()
+          except (ValueError, TypeError):
+              raise SystemExit('Invalid feed format') from None
+          Path('public').mkdir()
+          Path('public/supporters.json').write_bytes(raw)
+          print(f'Validated feed with {len(names)} names')
+          PY
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: public
+          retention-days: 1
+      - uses: actions/deploy-pages@v4
+        id: deployment
